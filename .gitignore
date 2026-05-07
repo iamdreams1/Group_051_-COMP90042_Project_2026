@@ -1,0 +1,34 @@
+# IDE / Claude / Cursor
+.cursor
+.claude
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Project caches & artefacts (太大，不进 git；走 Google Drive)
+cache/
+ckpt/
+
+# 数据集（174MB evidence.json 超 GitHub 100MB 上限；放 Drive 共享）
+data/evidence.json
+data/*.pkl
+
+# 模型权重 / embedding / faiss index
+*.npy
+*.pkl
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.index
+
+# 预测输出（每次跑都会重生成，不进 git）
+dev-predictions.json
+test-claims-predictions.json
+predictions/
