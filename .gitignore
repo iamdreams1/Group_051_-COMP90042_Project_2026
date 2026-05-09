@@ -12,7 +12,7 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Project caches & artefacts (太大，不进 git；走 Google Drive)
-cache/
+cache/*
 ckpt/
 
 # 数据集（174MB evidence.json 超 GitHub 100MB 上限；放 Drive 共享）
@@ -32,3 +32,8 @@ data/*.pkl
 dev-predictions.json
 test-claims-predictions.json
 predictions/
+
+# Small retrieval caches needed for the submitted notebook
+!cache/hybrid_train.pkl
+!cache/hybrid_dev.pkl
+!cache/hybrid_test.pkl
