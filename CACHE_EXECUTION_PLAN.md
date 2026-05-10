@@ -33,7 +33,6 @@ FORCE_REBUILD = {
     "bge": False,
     "eval": False,
     "hybrid": False,
-    "rerank": False,
 }
 ```
 
@@ -51,12 +50,12 @@ The following cache files are part of the official workflow.
 | `cache/bge_evidence_emb.npy` | BGE evidence embeddings | Drive only |
 | `cache/bge_faiss.index` | FAISS dense retrieval index | Drive only |
 | `cache/retrieval_eval_dev.pkl` | A1 Recall@K results | Drive or local cache |
-| `cache/hybrid_train.pkl` | Hybrid candidates for train | May be committed if small |
-| `cache/hybrid_dev.pkl` | Hybrid candidates for dev | May be committed if small |
-| `cache/hybrid_test.pkl` | Hybrid candidates for test | May be committed if small |
-| `cache/reranked_train.pkl` | Reranked train candidates | Drive or local cache |
-| `cache/reranked_dev.pkl` | Reranked dev candidates | Drive or local cache |
-| `cache/reranked_test.pkl` | Reranked test candidates | Drive or local cache |
+| `cache/hybrid_train.pkl` | Hybrid candidates for train (improved model) | May be committed if small |
+| `cache/hybrid_dev.pkl` | Hybrid candidates for dev (improved model) | May be committed if small |
+| `cache/hybrid_test.pkl` | Hybrid candidates for test (improved model) | May be committed if small |
+| `cache/bm25_train.pkl` | BM25 candidates for train (baseline) | May be committed if small |
+| `cache/bm25_dev.pkl` | BM25 candidates for dev (baseline) | May be committed if small |
+| `cache/bm25_test.pkl` | BM25 candidates for test (baseline) | May be committed if small |
 
 ## 4. Mandatory Cache Rules
 
@@ -74,7 +73,7 @@ All cache-producing code must follow these rules:
 
 Each cache must be checked before use.
 
-Hybrid and reranked caches must validate:
+Hybrid and BM25 candidate caches must validate:
 
 - claim ids exactly match the split
 - no missing claims
@@ -110,7 +109,7 @@ The notebook must follow this order:
 8. If any hybrid cache is missing, load/build BGE and FAISS only then.
 9. Load `retrieval_eval_dev.pkl`; recompute A1.a only if missing or forced.
 10. Load or build `hybrid_{train,dev,test}.pkl`.
-11. Load or build `reranked_{train,dev,test}.pkl`.
+11. Load or build `bm25_{train,dev,test}.pkl` (baseline candidates).
 12. Run classifier training or prediction.
 13. Release retrieval-only objects before classifier training when possible.
 
@@ -129,8 +128,6 @@ Do not run full BGE encoding unless `cache/bge_evidence_emb.npy` is missing or `
 
 Do not rerun A1.a dev retrieval every time. It must load `cache/retrieval_eval_dev.pkl` by default.
 
-Do not load CrossEncoder unless at least one `reranked_*.pkl` file is missing or invalid.
-
 ## 8. Colab RAM Requirements
 
 To stay within free Colab RAM limits:
@@ -139,7 +136,7 @@ To stay within free Colab RAM limits:
 - Delete `tokenized_corpus` immediately after BM25 is built.
 - Use `np.load(..., mmap_mode="r")` for large embedding files.
 - Do not keep full embeddings in RAM if FAISS index is already available.
-- Do not keep BM25, BGE model, FAISS index, CrossEncoder, and classifier model alive together unless strictly needed.
+- Do not keep BM25, BGE model, FAISS index, and classifier model alive together unless strictly needed.
 - Run `gc.collect()` after releasing large retrieval objects.
 
 ## 9. Team Workflow
@@ -160,7 +157,6 @@ FORCE_REBUILD = {
     "bge": False,
     "eval": False,
     "hybrid": False,
-    "rerank": False,
 }
 ```
 
