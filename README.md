@@ -1,3 +1,66 @@
+# Group 051 — Climate Fact-Checking Pipeline (Run Instructions)
+
+> 整合方案：三条对照实验路径都在 [Group_051__COMP90042_Project_2026.ipynb](Group_051__COMP90042_Project_2026.ipynb) 这一个 notebook 里完成。
+
+## 实验设计
+
+| 路径 | 检索 | 分类器 | 输出 |
+|---|---|---|---|
+| **Exp-1 Baseline** | BM25 top-5 | `microsoft/deberta-v3-base`（全量微调） | `baseline-{dev,test}-predictions.json` |
+| **Exp-2 Large** | custom BGE + reranker top-5 | `microsoft/deberta-v3-large` + LoRA (r=16, α=32) | `large-{dev,test}-predictions.json` |
+| **Exp-3 NLI（最终采用）** | custom BGE + reranker top-5 | `MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli` + LoRA | `nli-*.json`、`nli-per-evi-*.json`（A4.3）、`hybrid-*.json`（A4.5 routing） |
+
+A6 cell 会自动把这三条路径的 F / A / Hmean 汇总成对照表。
+
+## 一次性准备（首次运行前）
+
+1. **数据**：把 `train-claims.json` / `dev-claims.json` / `test-claims-unlabelled.json` / `evidence.json` / `eval.py` 放进 `data/`（仓库已带）。
+2. **Drive checkpoint 同步**：微调好的 BGE retriever / reranker 在 Colab Drive 上，本地需要从 Drive 拉到 `ckpt/`：
+   - `ckpt/custom-bge-retriever-final/` — 微调后的 `BAAI/bge-base-en-v1.5`
+   - `ckpt/custom-bge-reranker-final/` — 微调后的 `BAAI/bge-reranker-base`
+3. **环境**：Colab 上 cell `1.2` 的 `pip install` 一行会装齐 `rank_bm25 / sentence-transformers / transformers / peft / faiss-cpu` 等。
+
+## 怎么跑三套预测
+
+打开 notebook，在 **cell A3.1**（`# A3.1: 标签映射 + ...`）顶部把 `CLS_BACKBONE_CHOICE` 切到你想跑的实验：
+
+```python
+CLS_BACKBONE_CHOICE = 'base'   # Exp-1 baseline
+# CLS_BACKBONE_CHOICE = 'large'  # Exp-2 large
+# CLS_BACKBONE_CHOICE = 'nli'    # Exp-3 final
+```
+
+> 切到 `'base'` 时，`BACKBONE_CONFIG['base']['retrieval']` 自动是 `'bm25'`，因此还要回去把 **cell A2.b** 的 `RETRIEVAL_SOURCE` 也切到 `'bm25'`；切 `'large'` / `'nli'` 时 `RETRIEVAL_SOURCE = 'custom_end_to_end'`。Cell A3 训练入口有一致性 assert，跑错会立刻报错。
+
+然后 **Run All（或从 A2.b 开始 Run）**，会依次：
+- 检索 → `final_{train,dev,test}_evidence`
+- 训练 → `ckpt/cls_best_{base|large|nli}.pt`
+- A4.1 拼接推理 → `{prefix}-{dev,test}-predictions.json`
+- 仅 NLI 路径：A4.3 per-evidence → `nli-per-evi-*.json`，A4.5 hybrid routing → `hybrid-*.json`
+
+跑完三个 `CLS_BACKBONE_CHOICE` 后，运行 **cell A6** 出三路对照表，运行 **cell A5** 做端到端 smoke test。
+
+## 关键文件
+
+- 主笔记本：[Group_051__COMP90042_Project_2026.ipynb](Group_051__COMP90042_Project_2026.ipynb)
+- 评测：[data/eval.py](data/eval.py)、根目录 [eval.py](eval.py)
+- 缓存：`cache/`（gitignored；BM25 / raw BGE / 微调 BGE 索引在此重建）
+- 模型权重：`ckpt/`（gitignored；Colab 通过 Drive shortcut）
+- 实验路径整合脚本（一次性使用，可忽略）：[scripts/apply_integration.py](scripts/apply_integration.py)、[scripts/cleanup_hybrid_refs.py](scripts/cleanup_hybrid_refs.py)
+- 报告：[report/acl_latex.tex](report/acl_latex.tex)
+
+## Colab T4 显存预估
+
+| 实验 | Backbone | LoRA | 训练 batch | peak GPU |
+|---|---|---|---|---|
+| base  | DeBERTa-v3-base (180M)  | 否 | 8 (accum 2) | ~5 GB |
+| large | DeBERTa-v3-large (435M) | 是 | 4 (accum 4) | ~9 GB |
+| nli   | DeBERTa-v3-large NLI (435M) | 是 | 4 (accum 4) | ~9 GB |
+
+三条路径**串行重训**（不并发）；cell A3 训练入口前会自动 `release_large_objects(...)` 释放检索期的 BGE / BM25 / FAISS 对象。
+
+---
+
 # COMP90042 Project Description
 
 Please check the **lecture recording first** if you have any questions about Assignment 3 – Project (**Lecture 14, Friday, 24 April 2026**).

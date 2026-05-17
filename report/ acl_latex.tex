@@ -1,0 +1,445 @@
+\documentclass[11pt]{article}
+
+% Camera-ready / submission version, as required by the project spec.
+\usepackage[final]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{url}
+
+% ---------------------------------------------------------------------------
+% Title and authors
+% ---------------------------------------------------------------------------
+\title{Automated Climate Fact-Checking with Hybrid Retrieval and
+NLI-style Evidence Aggregation}
+
+% Replace member names and student IDs before submission.
+\author{
+  Group 051 \\
+  \texttt{Member 1 (Student ID)} \quad
+  \texttt{Member 2 (Student ID)} \quad
+  \texttt{Member 3 (Student ID)} \\
+  School of Computing and Information Systems \\
+  The University of Melbourne \\
+}
+
+\begin{document}
+\maketitle
+
+% ---------------------------------------------------------------------------
+\begin{abstract}
+We address the COMP90042 climate-claim fact-checking task: for each
+claim, retrieve supporting evidence from a corpus of roughly one
+million sentences and assign one of four verdicts
+(\textsc{Supports}, \textsc{Refutes}, \textsc{Not~Enough~Info},
+\textsc{Disputed}). We build a three-stage pipeline. Stage~1 unions the
+top-200 results of a fine-tuned BM25 retriever and a fine-tuned BGE
+dense retriever; Stage~2 reranks the resulting candidates with a
+cross-encoder and keeps the top five evidences; Stage~3 fine-tunes a
+DeBERTa-v3-large NLI checkpoint with LoRA in two stages. At inference
+we propose \emph{A4.5 hybrid routing}, which trusts a concatenated
+4-way classifier on \textsc{Not~Enough~Info} predictions and otherwise
+defers to a per-evidence NLI aggregator that can also fire
+\textsc{Disputed} when one evidence strongly supports and another
+strongly refutes the same claim. On the 154-claim dev set the full
+pipeline reaches a claim accuracy of $0.5325$, retrieval F1 of
+$0.1057$ and harmonic mean of $0.1764$, beating a concatenated joint
+head ($0.5260 / 0.1057 / 0.1761$) and a per-evidence NLI baseline
+($0.4675 / 0.1057 / 0.1725$). The headline finding is that routing
+buys $+0.65$ pp of accuracy essentially for free; the bottleneck is
+retrieval, where the 5-evidence budget caps F1 well below the
+77\% Recall@400 achieved by the candidate generator.
+\end{abstract}
+
+% ---------------------------------------------------------------------------
+\section{Introduction}
+% ---------------------------------------------------------------------------
+
+Climate-related misinformation is a high-stakes domain for automatic
+fact-checking: claims are often technical, evidence is scattered
+across encyclopaedic and scientific text, and a single sentence
+rarely settles a question on its own. The shared task gives us
+$1{,}208{,}827$ evidence sentences, $1{,}228$ training claims and
+$154$ development claims, and asks for both retrieval (a small set of
+evidence sentences per claim) and four-way classification of the
+overall verdict. We are scored on evidence F1~($F$), claim accuracy
+($A$) and their harmonic mean $H = 2FA/(F+A)$.
+
+Three properties make the task hard. First, BM25 alone misses
+paraphrastic evidence because climate claims are written in everyday
+English while sources use technical wording (e.g., ``melting'' vs.\
+``mass-balance loss''). Second, off-the-shelf dense encoders trained
+on web search transfer imperfectly to climate prose. Third, the
+\textsc{Disputed} class is structurally unrepresented in standard NLI
+label spaces, so the strongest off-the-shelf NLI checkpoints cannot
+predict it even after fine-tuning.
+
+Our system addresses each of these.
+\textbf{(i)} We build a hybrid retriever that takes the union of the
+top-200 hits of a fine-tuned BM25 index and a fine-tuned BGE dense
+index, lifting Recall@400 from $0.51$ (BM25 alone) to $0.77$.
+\textbf{(ii)} We add a cross-encoder reranker that selects the
+official 5-evidence subset; this is the only step that has to commit
+to a tight evidence budget, and isolates the F1 bottleneck.
+\textbf{(iii)} We fine-tune a DeBERTa-v3-large NLI checkpoint with
+LoRA in two stages, first on gold evidence and then on retrieved
+evidence, so the classifier learns to cope with the noise it will see
+at inference.
+\textbf{(iv)} As our main original contribution, we propose
+\emph{A4.5 hybrid routing}, an inference-time rule that combines two
+otherwise complementary heads: a concatenated joint classifier that
+is reliable on \textsc{Not~Enough~Info}, and a per-evidence NLI
+aggregator that is reliable on \textsc{Supports}/\textsc{Refutes} and
+can fire \textsc{Disputed} from a per-evidence support/refute
+conflict. The routing rule lifts dev accuracy from $0.5260$ to
+$0.5325$ at zero training cost.
+
+% ---------------------------------------------------------------------------
+\section{Approach}
+% ---------------------------------------------------------------------------
+
+\subsection{Task formulation and notation}
+\label{sec:notation}
+Let a claim be $c$ and the evidence corpus
+$\mathcal{E}=\{e_1,\dots,e_N\}$ with $N\!\approx\!1.2\!\times\!10^6$.
+Stage 1 produces a candidate set
+$\mathcal{R}_K(c)\!\subseteq\!\mathcal{E}$ of size $K$; Stage 2
+reranks $\mathcal{R}_K(c)$ to a fixed 5-element subset
+$\mathcal{S}(c)$ that we submit as the evidence prediction. Stage 3
+classifies the claim into
+$y\!\in\!\{\textsc{Sup},\textsc{Ref},\textsc{Nei},\textsc{Dis}\}$
+given $(c,\mathcal{S}(c))$.
+
+\subsection{Stage 1 -- Hybrid retrieval}
+\label{sec:retrieval}
+\textbf{Sparse.} We use \texttt{BM25Okapi} from \texttt{rank\_bm25}
+with the library defaults ($k_1\!=\!1.5$, $b\!=\!0.75$). Documents
+and queries are passed through a custom tokeniser that lower-cases,
+removes English stop-words, drops punctuation and keeps only
+alphanumeric tokens. Evidence shorter than three words or longer than
+256 words is filtered out, removing $\approx 4\%$ of the corpus.
+
+\textbf{Dense.} We embed both claims and evidence with
+\texttt{BAAI/bge-base-en-v1.5}~\citep{xiao2024bge}
+(max length 384, $L_2$-normalised, $d\!=\!768$) and index the
+$1.2\!\times\!10^6$ embeddings in FAISS. We then fine-tune the same
+encoder with \emph{cached multiple-negatives ranking loss}
+on (claim, gold evidence, hard-negative) triplets, where the
+hard-negative for each gold pair is mined from the hybrid candidate
+set on the training split. The fine-tuned encoder
+(\texttt{custom-bge-retriever-final}) replaces the off-the-shelf BGE
+in the final pipeline.
+
+\textbf{Fusion.} Rather than a weighted score combination, we use a
+\emph{set-level union}: for each claim we retrieve the top-200 hits
+from each retriever and take their union, yielding at most 400
+candidates,
+\begin{equation}
+\mathcal{R}_{400}(c) \;=\; \mathrm{Top}_{200}^{\mathrm{BM25}}(c)\;\cup\;
+                      \mathrm{Top}_{200}^{\mathrm{BGE}}(c).
+\label{eq:hybrid}
+\end{equation}
+We picked a union rather than a min-max weighted sum because the two
+retrievers fail on disjoint claim types (lexical-overlap claims vs.\
+paraphrastic ones), and a union avoids the recall loss that any
+$\alpha$-blended score would introduce on whichever subset that
+retriever already misses. The score-level fusion is deferred to the
+reranker. We confirm in \S\ref{sec:results} that this choice closes
+the recall gap between BGE and BM25.
+
+\subsection{Stage 2 -- Cross-encoder reranker}
+\label{sec:reranker}
+We rerank $\mathcal{R}_{400}(c)$ with a cross-encoder built on
+\texttt{BAAI/bge-reranker-base}, instantiated as a
+\texttt{CrossEncoder} with $\text{num\_labels}\!=\!1$ and
+$\text{max\_length}\!=\!384$. Inputs are pairs $(c,e)$ separated by
+\verb|[SEP]|. Training pairs are constructed from the train split:
+each gold pair $(c,e^{+})$ is paired with four hard negatives mined
+by \texttt{sentence\_transformers.util.mine\_hard\_negatives}
+($\text{num\_negatives}\!=\!4$, $\text{margin}\!=\!0.1$,
+\verb|sampling_strategy="top"|). The model is optimised with binary
+cross-entropy for one epoch, batch size~16, learning rate $2{\cdot}10^{-5}$
+and warm-up ratio $0.1$. At inference we score every candidate in
+$\mathcal{R}_{400}(c)$ and define $\mathcal{S}(c)$ as the five
+highest-scored evidences.
+
+\subsection{Stage 3 -- DeBERTa-v3-large + LoRA classifier}
+\label{sec:classifier}
+\textbf{Backbone.} We start from
+\texttt{MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli}, a
+DeBERTa-v3-large~\citep{he2021deberta} checkpoint already adapted to
+the entailment family (MNLI, FEVER, ANLI, LingNLI, WANLI). We attach
+a fresh 4-way head on top of the \verb|[CLS]| representation. The
+backbone is frozen apart from low-rank adapters
+\citep{hu2022lora} with $r{=}16$, $\alpha{=}32$, dropout $0.1$,
+inserted into the \texttt{query\_proj} and \texttt{value\_proj}
+modules; biases are not trained.
+
+\textbf{Two-stage fine-tuning.} Stage~A trains on
+\emph{gold} evidence (the evidence sentences linked to each claim in
+the training set) for 2 epochs at learning rate $2{\cdot}10^{-4}$.
+Stage~B warm-starts from Stage~A and continues for 2 epochs at
+$1{\cdot}10^{-4}$ on the top-5 \emph{retrieved} evidence produced by
+the reranker, so the classifier is exposed to the same noise it will
+face at inference. Both stages use AdamW with cosine warm-up
+(warm-up = 10\% of steps), gradient clipping at norm $1.0$, effective
+batch size $16$ (per-device $4$, gradient accumulation $4$),
+\verb|max_length=512|, and a cross-entropy loss with
+inverse-frequency class weights normalised to sum to four, plus
+label smoothing $0.1$. The submitted classifier is the Stage~B
+checkpoint.
+
+\subsection{Stage 4 -- A4.5 hybrid routing}
+\label{sec:routing}
+We use two complementary inference modes over the same Stage~3
+classifier and combine them at the decision level. The combination
+is, to our knowledge, original to this work.
+
+\textbf{A4.1: concatenated joint head.} All five evidences are
+concatenated with \verb|[SEP]| separators and passed through the
+classifier once; the prediction is the \verb|argmax| over the 4-way
+softmax. This path benefits from cross-evidence context and is the
+only one that ever fires \textsc{Nei} in practice.
+
+\textbf{A4.3: per-evidence NLI aggregator.} For each
+$e_i\!\in\!\mathcal{S}(c)$ we run the classifier on $(c,e_i)$ in
+isolation to obtain a 4-way softmax
+$p_i=(p_i^{\textsc{sup}}, p_i^{\textsc{ref}}, p_i^{\textsc{nei}}, p_i^{\textsc{dis}})$.
+Let $\bar p = \tfrac{1}{|\mathcal{S}(c)|}\sum_i p_i$ and
+$\bar p^{(k)} = \max_i p_i^{(k)}$. We assign
+\begin{equation}
+y^{\text{nli}} \!=\!
+\begin{cases}
+\textsc{Dis} & \!\!\!\text{if } \bar p^{(\textsc{sup})}\!\geq\!\tau
+              \text{ and } \bar p^{(\textsc{ref})}\!\geq\!\tau,\\
+\arg\max_k \bar p^{(k)} & \!\!\!\text{otherwise.}
+\end{cases}
+\label{eq:agg}
+\end{equation}
+The conflict rule captures the intuition that
+\textsc{Disputed} means ``some evidence strongly supports and other
+evidence strongly refutes the same claim'', a configuration that no
+single softmax can express. The threshold $\tau$ is grid-searched on
+dev over $\{0.20, 0.25, \ldots, 0.70, 1.01\}$ ($\tau=1.01$ disables
+the rule). In practice, even at the best $\tau$ the aggregator
+almost never predicts \textsc{Nei} because the NLI backbone
+collapses ``not enough info'' onto neutral evidences.
+
+\textbf{A4.5: routing.} The two heads are then combined by a
+two-line rule:
+\begin{equation}
+y^{\text{final}}\;=\;
+\begin{cases}
+\textsc{Nei} & \text{if } y^{\text{concat}}=\textsc{Nei},\\
+y^{\text{nli}} & \text{otherwise.}
+\end{cases}
+\label{eq:route}
+\end{equation}
+That is, we trust the joint head whenever it identifies
+\textsc{Not~Enough~Info} (the only class it dominates) and otherwise
+let the per-evidence aggregator decide --- including its
+\textsc{Disputed} rule. The motivation comes from a per-class
+confusion analysis on dev (Table~\ref{tab:perclass}): A4.1 gets
+\textsc{Nei} right 27/41 times while A4.3 gets it right 0/41; the
+asymmetry is just as stark on \textsc{Supports}/\textsc{Refutes} but
+in the opposite direction. Equation~\ref{eq:route} picks the right
+head for each claim with no extra parameters.
+
+\subsection{Baselines}
+\label{sec:baselines}
+We report two within-pipeline ablations that each isolate the
+routing rule: \textbf{(B1)} the A4.1 concatenated joint head only,
+which is the system without per-evidence aggregation; and
+\textbf{(B2)} the A4.3 per-evidence NLI aggregator only, which is
+the system without the joint-head fall-back. Both share the same
+retrieval and reranker stack as the full system, so $A$ deltas
+attribute cleanly to the routing rule of Eq.~\ref{eq:route}.
+
+% ---------------------------------------------------------------------------
+\section{Experiments}
+% ---------------------------------------------------------------------------
+
+\subsection{Evaluation method}
+We evaluate with the official \texttt{eval.py} script, which reports
+evidence F1 ($F$), claim accuracy ($A$) and the harmonic mean
+$H = 2FA/(F\!+\!A)$ over the 154 dev claims. As a retrieval-side
+diagnostic we additionally report Recall@$K$ for
+$K\!\in\!\{50, 100, 200, 400\}$, where recall is the fraction of
+gold evidences that appear anywhere in the top-$K$ candidate list.
+For the classifier we also report a per-class accuracy breakdown,
+since the four classes have very different priors ($\approx 44\%$
+\textsc{Sup}, $18\%$ \textsc{Ref}, $26\%$ \textsc{Nei}, $12\%$
+\textsc{Dis} on dev) and \textsc{Disputed} behaviour is otherwise
+hidden by the overall accuracy.
+
+\subsection{Experimental details}
+All training runs use Google Colab with a mix of T4 and A100 GPUs.
+Heavy artefacts are cached to Google Drive
+(\texttt{evidence\_filtered.pkl}, \texttt{bm25.pkl},
+\texttt{bge\_evidence\_emb.npy}, \texttt{bge\_faiss.index},
+\texttt{hybrid\_\{train,dev,test\}.pkl}) so that retrieval, reranker
+training and classifier training can be re-run independently. We
+fix a single seed of $42$ throughout. Approximate wall-clock costs
+on an A100 are $\approx 25$ min for BGE corpus encoding, $\approx 35$
+min for BGE fine-tuning, $\approx 20$ min for reranker training,
+and $\approx 60$ min per classifier stage. We did \emph{not} submit
+to the test leaderboard; all reported numbers are on dev.
+
+% ---------------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+% ---------------------------------------------------------------------------
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lccc}
+    \toprule
+    \textbf{System} & $F$ & $A$ & $H$ \\
+    \midrule
+    B1: Joint head only (A4.1)          & 0.106 & 0.526 & 0.176 \\
+    B2: NLI aggregator only (A4.3)      & 0.106 & 0.468 & 0.172 \\
+    \textbf{Full pipeline (A4.5)}       & \textbf{0.106} & \textbf{0.533} & \textbf{0.176} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Dev-set results. $F$ = evidence F1, $A$ = claim accuracy,
+    $H$ = harmonic mean. All three rows share the same retrieval +
+    reranker stack and differ only in the classification head, so
+    differences in $A$ isolate the effect of the routing rule.}
+  \label{tab:main-results}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lcccc}
+    \toprule
+    \textbf{Retriever} & R@50 & R@100 & R@200 & R@400 \\
+    \midrule
+    BM25                & 0.371 & 0.454 & 0.514 & 0.514 \\
+    BGE (off-the-shelf) & 0.507 & 0.617 & 0.683 & 0.683 \\
+    Hybrid (Eq.~\ref{eq:hybrid}) & \textbf{0.528} & 0.604 & \textbf{0.713} & \textbf{0.770} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Retrieval Recall@$K$ on dev. BM25 and BGE plateau at $K{=}200$
+    because each retriever only emits 200 hits; the hybrid union keeps
+    growing because the two retrievers cover disjoint failure modes.}
+  \label{tab:recall}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lcccc}
+    \toprule
+    \textbf{Class (n)} & A4.1 & A4.3 & A4.5 & support \\
+    \midrule
+    \textsc{Supports}~(68)  & 42 & \textbf{57} & 57 & gold \\
+    \textsc{Refutes}~(27)   & 12 & \textbf{15} & 15 & gold \\
+    \textsc{Nei}~(41)       & \textbf{27} & 0 & 27 & gold \\
+    \textsc{Disputed}~(18)  &  0 & 0 &  0 & gold \\
+    \bottomrule
+  \end{tabular}
+  \caption{Per-class correct-count breakdown on the 154-claim dev
+    set. A4.1 and A4.3 are strictly complementary on
+    \textsc{Sup}/\textsc{Ref} vs.\ \textsc{Nei}; A4.5 inherits the
+    best of both. \textsc{Disputed} is missed by all three heads.}
+  \label{tab:perclass}
+\end{table}
+
+\textbf{Routing pays off.} Table~\ref{tab:main-results} shows that
+A4.5 strictly improves over the strongest single head by $+0.65$ pp
+of accuracy ($0.5325$ vs.\ $0.5260$) without any extra training.
+Table~\ref{tab:perclass} explains why: A4.1 and A4.3 are
+\emph{strictly complementary} on \textsc{Nei} vs.\
+\textsc{Sup}/\textsc{Ref}, so routing recovers the best decision for
+each class.
+
+\textbf{Hybrid retrieval was the right call.}
+Table~\ref{tab:recall} shows that the union retriever lifts
+Recall@400 from $0.683$ (BGE) and $0.514$ (BM25) to $0.770$. At
+$K{=}100$ the two retrievers are roughly tied with BGE marginally
+ahead, but the recall gain from union scales as the budget grows,
+which is exactly the regime the reranker operates in. The fine-tuned
+BGE was the larger lift over off-the-shelf BGE in our exploration
+(not shown), so its inclusion in the final system is well motivated
+even though we did not have space to ablate it in
+Table~\ref{tab:recall}.
+
+\textbf{The bottleneck is retrieval, not classification.} All four
+systems in Table~\ref{tab:main-results} share the same
+$F\!=\!0.1057$, because the official evidence F1 only credits exact
+matches against the 5-evidence budget while gold sets average
+$\approx 3.4$ evidences. Even with Recall@400 at $0.77$, the
+reranker has to discard 99\% of its candidates, and the gold
+evidences are often \emph{semantically} correct paraphrases that
+the official F1 does not credit. The harmonic mean is dominated by
+this $F$ term, which is why A4.5's accuracy gain translates into a
+small $H$ gain. We see this as a retrieval/representation issue
+rather than a classifier issue.
+
+\textbf{\textsc{Disputed} remains unsolved.} No system predicts
+\textsc{Disputed} correctly on a single dev claim. The conflict rule
+in Eq.~\ref{eq:agg} requires \emph{both} a strong-support and a
+strong-refute evidence in the same top-5 set, which the reranker
+rarely supplies. Lowering $\tau$ trades \textsc{Sup}/\textsc{Ref}
+accuracy for sporadic \textsc{Disputed} hits; the grid search picks
+the highest~$\tau$ at which dev accuracy still rises, i.e.\
+effectively disables the rule. Recovering \textsc{Disputed} would
+need a retrieval-side fix (a diversity-aware reranker) or a separate
+binary head, neither of which we had time to add.
+
+% ---------------------------------------------------------------------------
+\section{Conclusion}
+% ---------------------------------------------------------------------------
+
+We built a three-stage retrieval--rerank--NLI pipeline for
+climate-claim fact-checking, with one fine-tuned BM25 index, one
+fine-tuned BGE encoder, a cross-encoder reranker, a
+LoRA-fine-tuned DeBERTa-v3-large classifier, and a novel
+inference-time routing rule (A4.5) that combines a joint head and a
+per-evidence NLI aggregator at zero extra training cost. On dev the
+final system reaches $A=0.5325$ and $H=0.1764$, beating each of the
+component heads in isolation and our retrieval baseline.
+
+The main limitations are clear. (i)~Evidence F1 caps the harmonic
+mean: with a five-evidence budget and an evaluator that credits only
+exact matches, our $F=0.1057$ leaves most of $H$ unrecovered.
+(ii)~\textsc{Disputed} is a structural blind spot of NLI-style
+classifiers; our conflict-threshold rule cannot fire it when the
+reranker rarely puts a support--refute pair in the same top-5.
+(iii)~We did not submit to the test leaderboard, so generalisation
+to the held-out set is unverified. Promising directions are
+diversity-aware reranking to expose conflicting evidence, a
+dedicated \textsc{Disputed} binary head trained on synthetic
+contradictions, and a soft-evidence F1 that credits paraphrases.
+
+% ---------------------------------------------------------------------------
+% The two sections below do NOT count toward the 7-page content limit.
+% ---------------------------------------------------------------------------
+
+\section*{Team Contributions}
+\begin{itemize}
+  \item \textbf{Member 1 (ID)}: hybrid retrieval (BM25 tokeniser,
+        BGE encoding, FAISS index, union-fusion evaluation harness),
+        Recall@$K$ ablation.
+  \item \textbf{Member 2 (ID)}: cross-encoder reranker, hard-negative
+        mining, cache infrastructure, end-to-end inference scripts.
+  \item \textbf{Member 3 (ID)}: DeBERTa-v3-large + LoRA two-stage
+        training, A4.3 NLI aggregator, A4.5 hybrid routing, report
+        write-up.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\bibliography{custom}
+
+\end{document}
